@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>딸기 하이라이트 뷰어</title>
+<style>
+  :root { --bg:#111; --panel:#1c1c1ecc; --fg:#eee; --mut:#9a9a9a; --acc:#ffd84a; }
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif;overflow:hidden}
+  #view{position:fixed;inset:0}
+  #panel{position:fixed;top:12px;left:12px;width:340px;max-height:calc(100% - 24px);overflow:auto;background:var(--panel);backdrop-filter:blur(8px);border-radius:10px;padding:14px 16px;box-sizing:border-box}
+  h1{font-size:16px;margin:0 0 10px}
+  h2{font-size:13px;margin:14px 0 6px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+  label.row{display:flex;align-items:center;gap:8px;margin:4px 0}
+  input[type=number]{width:90px;background:#000;color:var(--fg);border:1px solid #444;border-radius:4px;padding:3px 6px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:4px 4px;text-align:right;border-bottom:1px solid #333}
+  th:first-child,td:first-child{text-align:left}
+  tr.inst{cursor:pointer} tr.inst:hover{background:#ffffff14} tr.sel{background:#ffd84a22}
+  .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:middle}
+  .note{color:var(--mut);font-size:12px;margin-top:8px}
+  #status{position:fixed;right:12px;bottom:12px;color:var(--mut);font-size:12px;background:var(--panel);padding:6px 10px;border-radius:6px}
+  button{background:#333;color:var(--fg);border:1px solid #555;border-radius:5px;padding:4px 9px;cursor:pointer} button:hover{background:#444}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "@mkkellogg/gaussian-splats-3d": "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js"
+} }
+</script>
+</head>
+<body>
+<div id="view"></div>
+<div id="panel">
+  <h1>딸기 영역 하이라이트 · 크기 추정</h1>
+  <label class="row"><input type="checkbox" id="hl" checked> 딸기 하이라이트 (색 강조)</label>
+  <label class="row"><input type="checkbox" id="boxes" checked> 딸기 바운딩 박스 / 라벨</label>
+  <label class="row"><input type="checkbox" id="rest" checked> 화분·잎(나머지) 표시</label>
+  <h2>스케일 보정</h2>
+  <div class="note">3DGS 좌표계는 임의 단위입니다. 실제 길이를 아는 물체 하나를 입력하면 cm로 환산됩니다.</div>
+  <label class="row">화분 긴 변 실제 길이 <input type="number" id="potcm" step="0.5" value="45"> cm</label>
+  <div class="note" id="potinfo"></div>
+  <label class="row">또는 직접 입력: 1 unit = <input type="number" id="cmpu" step="0.01"> cm</label>
+  <h2>딸기 인스턴스</h2>
+  <table><thead><tr><th>#</th><th>가우시안</th><th>L×W×H (cm)</th><th>등가지름</th></tr></thead><tbody id="rows"></tbody></table>
+  <div class="note">행을 클릭하면 해당 딸기로 시점을 이동합니다. 마우스: 좌클릭 회전 · 우클릭 이동 · 휠 줌.</div>
+  <div class="note">L/W/H = 가우시안 중심 분포의 주축(PCA) 길이(2~98 백분위) + 가우시안 반경 보정. 익은(빨간) 딸기만 검출 대상입니다.</div>
+</div>
+<div id="status">로딩 중…</div>
+<script type="module">
+import * as THREE from 'three';
+import * as GS from '@mkkellogg/gaussian-splats-3d';
+
+const status = (t) => document.getElementById('status').textContent = t;
+const data = await (await fetch('strawberries.json')).json();
+const cams = await (await fetch('cameras.json')).json();
+const palette = [[1,0.95,0.1],[0.2,1,1],[1,0.3,1],[0.3,1,0.3],[1,0.6,0.1],[0.5,0.6,1]];
+
+// ---------- camera placement from the training cameras (COLMAP convention: camera y axis points down) ----------
+const up = new THREE.Vector3(); const meanPos = new THREE.Vector3();
+for (const c of cams) { up.add(new THREE.Vector3(-c.rotation[0][1], -c.rotation[1][1], -c.rotation[2][1])); meanPos.add(new THREE.Vector3(...c.position)); }
+up.normalize(); meanPos.divideScalar(cams.length);
+const target = new THREE.Vector3();
+if (data.instances.length) { for (const s of data.instances) target.add(new THREE.Vector3(...s.center)); target.divideScalar(data.instances.length); }
+else if (data.planters.length) target.set(...data.planters[0].center);
+let best = null, bestD = Infinity;   // start from a real camera pose (nearest to the mean position) so the scene is in view
+for (const c of cams) { const d = new THREE.Vector3(...c.position).distanceTo(meanPos); if (d < bestD) { bestD = d; best = c; } }
+const pos = best ? new THREE.Vector3(...best.position) : meanPos.clone();
+// keep that camera's viewing direction but frame all strawberries: distance from their spread
+let spread = 0; for (const s of data.instances) spread = Math.max(spread, new THREE.Vector3(...s.center).distanceTo(target));
+const dist = Math.max(0.8, spread * 2.2 + 0.6);
+pos.sub(target).normalize().multiplyScalar(dist).add(target);
+
+// ---------- overlay (boxes + labels), rendered on top of the splats in our own loop ----------
+const overlay = new THREE.Scene(); const boxGroup = new THREE.Group(); overlay.add(boxGroup);
+const labels = [];
+function makeSprite() {
+  const cv = document.createElement('canvas'); cv.width = 640; cv.height = 128;
+  const tex = new THREE.CanvasTexture(cv); tex.minFilter = THREE.LinearFilter;
+  return new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, depthWrite: false, transparent: true }));
+}
+for (const s of data.instances) {
+  const color = new THREE.Color(...palette[s.id % palette.length]);
+  const m = new THREE.Matrix4(); const a = s.axes;  // rows = principal axes -> columns of the rotation matrix
+  m.set(a[0][0], a[1][0], a[2][0], s.center[0],  a[0][1], a[1][1], a[2][1], s.center[1],  a[0][2], a[1][2], a[2][2], s.center[2],  0, 0, 0, 1);
+  const geo = new THREE.BoxGeometry(...s.extent);
+  const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color, depthTest: false, transparent: true, opacity: 0.95 }));
+  const fill = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color, depthTest: false, depthWrite: false, transparent: true, opacity: 0.12 }));
+  edges.applyMatrix4(m); fill.applyMatrix4(m); boxGroup.add(edges, fill);
+  const sp = makeSprite(); sp.position.set(...s.center).addScaledVector(up, s.extent[0] * 1.1);
+  const sc = s.extent[0] * 2.2; sp.scale.set(sc, sc / 5, 1); boxGroup.add(sp); labels.push({ sp, s, color });
+}
+
+// ---------- scale calibration + table ----------
+const potcm = document.getElementById('potcm'), cmpu = document.getElementById('cmpu'), potinfo = document.getElementById('potinfo');
+const potLen = data.planters.length ? data.planters[0].extent[0] : null;
+potinfo.textContent = potLen ? `검출된 화분 긴 변 = ${potLen.toFixed(4)} unit (화분 ${data.planters.length}개 중 가장 긴 것)` : '화분을 자동 검출하지 못했습니다. 아래에 직접 입력하세요.';
+function scaleCm() { const d = parseFloat(cmpu.value); if (d > 0) return d; if (potLen && parseFloat(potcm.value) > 0) return parseFloat(potcm.value) / potLen; return null; }
+const fmt = (v, k) => k ? (v * k).toFixed(1) : v.toFixed(4);
+function refresh() {
+  const k = scaleCm(); const unit = k ? 'cm' : 'unit'; const rows = document.getElementById('rows'); rows.innerHTML = '';
+  for (const { sp, s, color } of labels) {
+    const [L, W, H] = s.extent; const d = s.equiv_diameter;
+    const g = sp.material.map.image.getContext('2d'); g.clearRect(0, 0, 640, 128);
+    g.fillStyle = 'rgba(0,0,0,0.6)'; g.fillRect(0, 0, 640, 128);
+    g.font = 'bold 44px system-ui, sans-serif'; g.fillStyle = '#' + color.getHexString(); g.textBaseline = 'middle';
+    g.fillText(`#${s.id}  ${fmt(L, k)} × ${fmt(W, k)} × ${fmt(H, k)} ${unit}`, 16, 64); sp.material.map.needsUpdate = true;
+    const tr = document.createElement('tr'); tr.className = 'inst';
+    tr.innerHTML = `<td><span class="sw" style="background:#${color.getHexString()}"></span>${s.id}</td><td>${s.n_gaussians}</td><td>${fmt(L, k)} × ${fmt(W, k)} × ${fmt(H, k)}</td><td>${fmt(d, k)} ${unit}</td>`;
+    tr.onclick = () => focusOn(s, tr); rows.appendChild(tr);
+  }
+}
+potcm.oninput = refresh; cmpu.oninput = refresh; refresh();
+
+// ---------- splat viewer (self-driven mode off: we render splats, then the overlay on top) ----------
+const viewer = new GS.Viewer({
+  rootElement: document.getElementById('view'), selfDrivenMode: false, useBuiltInControls: true,
+  cameraUp: up.toArray(), initialCameraPosition: pos.toArray(), initialCameraLookAt: target.toArray(),
+  sharedMemoryForWorkers: false, dynamicScene: true, sceneRevealMode: GS.SceneRevealMode.Instant, antialiased: true,
+});
+const HIDE = 1e-6;
+const setVis = (i, on) => { const s = viewer.getSplatScene(i); if (s) s.scale.set(on ? 1 : HIDE, on ? 1 : HIDE, on ? 1 : HIDE); };
+const hlBox = document.getElementById('hl'), boxBox = document.getElementById('boxes'), restBox = document.getElementById('rest');
+function applyVis() { setVis(0, restBox.checked); setVis(1, !hlBox.checked); setVis(2, hlBox.checked); boxGroup.visible = boxBox.checked; }
+hlBox.onchange = applyVis; boxBox.onchange = applyVis; restBox.onchange = applyVis;
+function focusOn(s, tr) {
+  document.querySelectorAll('tr.inst').forEach(r => r.classList.remove('sel')); tr.classList.add('sel');
+  const c = new THREE.Vector3(...s.center); const cam = viewer.camera; const ctl = viewer.controls; if (!cam || !ctl) return;
+  const dir = new THREE.Vector3().subVectors(cam.position, ctl.target).normalize();
+  ctl.target.copy(c); cam.position.copy(c).addScaledVector(dir, s.extent[0] * 6); ctl.update();
+}
+let ready = false;
+function loop() {
+  requestAnimationFrame(loop);
+  if (!ready) return;
+  viewer.update(); viewer.render();
+  const r = viewer.renderer; r.autoClear = false; r.render(overlay, viewer.camera); r.autoClear = true;
+}
+loop();
+const scenes = [{ path: 'rest.ply' }, { path: 'strawberries.ply' }, { path: 'strawberries_hl.ply' }].map(s => ({ ...s, splatAlphaRemovalThreshold: 1 }));
+await viewer.addSplatScenes(scenes, true);
+applyVis(); ready = true;
+status(`가우시안 ${data.n_gaussians.toLocaleString()}개 · 딸기 ${data.instances.length}개 검출 (iteration ${data.model_iteration})`);
+</script>
+</body>
+</html>
